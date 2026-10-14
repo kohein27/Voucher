@@ -1,0 +1,243 @@
+import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:excel/excel.dart' as excel_lib;
+import 'package:blue_thermal_printer/blue_thermal_printer.dart';
+import 'package:esc_pos_utils/esc_pos_utils.dart';
+import 'dart:typed_data';
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Wi-Fi Voucher Printer',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: const VoucherPrinterScreen(),
+    );
+  }
+}
+
+class VoucherPrinterScreen extends StatefulWidget {
+  const VoucherPrinterScreen({Key? key}) : super(key: key);
+
+  @override
+  _VoucherPrinterScreenState createState() => _VoucherPrinterScreenState();
+}
+
+class _VoucherPrinterScreenState extends State<VoucherPrinterScreen> {
+  BlueThermalPrinter bluetooth = BlueThermalPrinter.instance;
+  List<BluetoothDevice> _devices = [];
+  BluetoothDevice? _selectedDevice;
+  bool _connected = false;
+
+  List<Map<String, dynamic>> _vouchers = [];
+  bool _isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    initBluetooth();
+  }
+
+  Future<void> initBluetooth() async {
+    bool? isConnected = await bluetooth.isConnected;
+    List<BluetoothDevice> devices = [];
+    try {
+      devices = await bluetooth.getBondedDevices();
+    } catch (e) {
+      print("Error: $e");
+    }
+
+    setState(() {
+      _devices = devices;
+      _connected = isConnected ?? false;
+    });
+  }
+
+  // Excel ဖိုင္ကို ဖတ္ျခင္း
+  Future<void> _pickAndParseExcel() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['xlsx', 'xls'],
+    );
+
+    if (result != null && result.files.single.bytes != null) {
+      setState(() => _isLoading = true);
+
+      Uint8List bytes = result.files.single.bytes!;
+      var excel = excel_lib.Excel.decodeBytes(bytes);
+      
+      List<Map<String, dynamic>> parsedVouchers = [];
+
+      for (var table in excel.tables.keys) {
+        var sheet = excel.tables[table];
+        if (sheet == null) continue;
+
+        // ပထမဆုံး row က Header ဖြစ်ို့ 2nd row ကေနစစစ္ပါ
+        for (var i = 1; i < sheet.rows.length; i++) {
+          var row = sheet.rows[i];
+          if (row.isEmpty || row[0]?.value == null) continue;
+
+          String code = row[0]?.value.toString() ?? '';
+          String group = row[1]?.value.toString() ?? '';
+          String status = row[2]?.value.toString() ?? '';
+          String price = row[4]?.value.toString() ?? '';
+          String period = row[5]?.value.toString() ?? '';
+
+          parsedVouchers.add({
+            'code': code,
+            'group': group,
+            'status': status,
+            'price': price,
+            'period': period,
+          });
+        }
+      }
+
+      setState(() {
+        _vouchers = parsedVouchers;
+        _isLoading = false;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Vouchers Loaded: ${_vouchers.length} ခု ရရွိပါသည္။')),
+      );
+    }
+  }
+
+  // 58mm Printer သို႔ ပို႔၍ ထုတ္ျခင္း
+  Future<void> _printVoucher(Map<String, dynamic> voucher) async {
+    if (_connected) {
+      ProfileDecoration? profile = await CapabilityProfile.load();
+      final generator = Generator(PaperSize.mm58, profile);
+      List<int> bytes = [];
+
+      bytes += generator.text('SHWE TOE AUNG', styles: PosStyles(align: PosAlign.center, bold: true, height: PosTextSize.size2, width: PosTextSize.size2));
+      bytes += generator.text('Guest House Wi-Fi Voucher', styles: PosStyles(align: PosAlign.center, fontSize: PosTextSize.size1));
+      bytes += generator.hr();
+
+      bytes += generator.row([
+        PosColumn(text: 'Code:', width: 4, styles: PosStyles(bold: true)),
+        PosColumn(text: voucher['code'], width: 8, styles: PosStyles(bold: true, align: PosAlign.right, height: PosTextSize.size2)),
+      ]);
+      
+      bytes += generator.row([
+        PosColumn(text: 'Package:', width: 4),
+        PosColumn(text: voucher['period'], width: 8, styles: PosStyles(align: PosAlign.right)),
+      ]);
+
+      bytes += generator.row([
+        PosColumn(text: 'Price:', width: 4),
+        PosColumn(text: '${voucher['price']} MMK', width: 8, styles: PosStyles(align: PosAlign.right)),
+      ]);
+
+      bytes += generator.hr();
+      bytes += generator.text('Please enjoy your internet access!', styles: PosStyles(align: PosAlign.center, fontType: PosFontType.fontB));
+      bytes += generator.feed(2);
+      bytes += generator.cut();
+
+      bluetooth.writeBytes(Uint8List.fromList(bytes));
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ေက်းဇူးျပဳ၍ Bluetooth Printer ခ်ိတ္ဆက္ေပးပါ။')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Wi-Fi Voucher 58mm Printer'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: initBluetooth,
+          )
+        ],
+      ),
+      body: Column(
+        children: [
+          // Bluetooth Device Selection
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Row(
+              children: [
+                Expanded(
+                  child: DropdownButton<BluetoothDevice>(
+                    items: _devices.map((device) {
+                      return DropdownMenuItem(
+                        value: device,
+                        child: Text(device.name ?? "Unknown Device"),
+                      );
+                    }).toList(),
+                    hint: const Text('Printer ကို ေ႐ြးပါ'),
+                    value: _selectedDevice,
+                    onChanged: (device) {
+                      setState(() => _selectedDevice = device);
+                    },
+                    isExpanded: true,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                ElevatedButton(
+                  onPressed: () {
+                    if (_selectedDevice != null) {
+                      bluetooth.connect(_selectedDevice!).then((connected) {
+                        setState(() => _connected = true);
+                      }).catchError((err) {
+                        setState(() => _connected = false);
+                      });
+                    }
+                  },
+                  child: Text(_connected ? 'ခ်ိတ္ဆက္ၿပီး' : 'ခ်ိတ္ဆက္မည္'),
+                ),
+              ],
+            ),
+          ),
+          const Divider(),
+          // Load Excel Button
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: ElevatedButton.icon(
+              onPressed: _isLoading ? null : _pickAndParseExcel,
+              icon: const Icon(Icons.file_upload),
+              label: const Text('Excel ဖိုင္ (Voucher.xlsx) တင္မည္'),
+              style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(45)),
+            ),
+          ),
+          // Voucher List
+          Expanded(
+            child: _isLoading
+                ? const Center(child: CircularProgressIndicator())
+                : _vouchers.isEmpty
+                    ? const Center(child: Text('Excel ဖိုင္ တင္ထားျခင္း မရွိေသးပါ။'))
+                    : ListView.builder(
+                        itemCount: _vouchers.length,
+                        itemBuilder: (context, index) {
+                          var v = _vouchers[index];
+                          return Card(
+                            margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            child: ListTile(
+                              title: Text('Code: ${v['code']}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                              subtitle: Text('Duration: ${v['period']} | Price: ${v['price']} MMK | Status: ${v['status']}'),
+                              trailing: IconButton(
+                                icon: const Icon(Icons.print, color: Colors.blue),
+                                onPressed: () => _printVoucher(v),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+          ),
+        ],
+      ),
+    );
+  }
+}
